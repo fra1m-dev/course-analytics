@@ -8,7 +8,7 @@
 *.tsbuildinfo
 /uploads
 /Makefile
-/test
+# /test
 docker-*
 
 # Logs
