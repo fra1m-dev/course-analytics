@@ -1,58 +1,180 @@
-# course-analytics
+# course-analytics (analytics-service)
 
-NestJS‑микросервис для аналитики квизов. Слушает событие `quiz.submitted` из RabbitMQ, **идемпотентно** сохраняет попытки по `(userId, quizId)`, считает базовые агрегаты и предоставляет HTTP‑эндпойнты для статистики.
-
----
+Микросервис аналитики прохождения квизов. Работает как RMQ RPC-сервис: принимает `analytics.submit`, рассчитывает результат, сохраняет попытки в Postgres и отдает агрегаты по пользователю. HTTP используется только для health-check.
 
 ## Содержание
 
-- [Функционал](#функционал)
-- [Технологии](#технологии)
+- [Обзор](#обзор)
+- [Архитектура и поток данных](#архитектура-и-поток-данных)
+- [Контракты RMQ](#контракты-rmq)
+- [Хранилище](#хранилище)
 - [Переменные окружения](#переменные-окружения)
 - [Быстрый старт](#быстрый-старт)
-  - [Локально (Node)](#локально-node)
-  - [Docker Compose (dev)](#docker-compose-dev)
-- [Публикация тестового события в RabbitMQ UI](#публикация-тестового-события-в-rabbitmq-ui)
-- [HTTP API](#http-api)
-- [Структура БД](#структура-бд)
-- [Тесты и линт](#тесты-и-линт)
-- [CI/CD и релизы](#cicd-и-релизы)
-- [Kubernetes (примеры)](#kubernetes-примеры)
-- [Troubleshooting](#troubleshooting)
+- [Docker](#docker)
+- [Проверка здоровья](#проверка-здоровья)
+- [Скрипты](#скрипты)
+- [Структура проекта](#структура-проекта)
+- [Диагностика](#диагностика)
 - [Лицензия](#лицензия)
 
----
+## Обзор
 
-## Функционал
+- Вход по RMQ: `analytics.submit`, `analytics.getAggByUserId`.
+- Расчет `score` и `passed` по данным квиза (порог 70).
+- Upsert попытки по ключу `(userId, quizId)` - повторный submit перезаписывает запись.
+- Хранилище: PostgreSQL + TypeORM, авто-синхронизация в dev.
+- HTTP только для `/health/live` и `/health/ready`.
 
-- Принимает событие `quiz.submitted` (RabbitMQ) и **идемпотентно** upsert’ит попытку по `(userId, quizId)`.
-- Вычисляет `score` и `passed` (либо принимает их из события) и сохраняет в БД.
-- HTTP‑эндпойнты:
-  - `GET /analytics/quiz/:quizId/summary` — агрегаты по квизу.
-  - `GET /analytics/user/:userId/summary` — список попыток пользователя.
+## Архитектура и поток данных
 
----
+Компоненты:
+- NestJS приложение (HTTP + RMQ microservice).
+- PostgreSQL (TypeORM).
+- RMQ (очередь `RMQ_ANALYTICS_QUEUE`, по умолчанию `analytics`).
+- Логи: pino + перехватчик RMQ.
+- RMQ-клиенты для `lessons`, `users`, `analytics` зарегистрированы в модуле (пока не используются в бизнес-логике).
 
-## Технологии
+Поток:
+1) Другой сервис отправляет RPC `analytics.submit` в очередь analytics.
+2) Analytics считает `score` и `passed`, сохраняет/обновляет попытку.
+3) Ответ возвращается по RPC с полем `attempt` и теми же `stats`.
+4) Для агрегатов отправляется `analytics.getAggByUserId`.
 
-- **NestJS** (HTTP + RMQ microservice)
-- **RabbitMQ** (transport)
-- **PostgreSQL 17** + **TypeORM**
-- **Jest** (юнит‑тесты)
-- **GitHub Actions** (CI)
+## Контракты RMQ
 
----
+### analytics.submit
+
+Назначение: принять результат квиза, сохранить попытку и вернуть обновленные данные.
+
+Вход `data`:
+- `meta.requestId` - строка для корреляции логов.
+- `userId` - id пользователя.
+- `dto` - данные попытки.
+- `stats` - объект `StatsModel` (пробрасывается обратно без изменений).
+
+`dto`:
+- `quizId` (int, required)
+- `lessonId` (int, optional)
+- `courseId` (int, optional)
+- `questionsTotal` (int, min 1)
+- `correctCount` (int, min 0)
+
+Пример запроса (RabbitMQ UI / Nest RMQ transport):
+```json
+{
+  "pattern": "analytics.submit",
+  "data": {
+    "meta": { "requestId": "req-1" },
+    "userId": 42,
+    "dto": {
+      "quizId": 10,
+      "lessonId": 1,
+      "courseId": 17,
+      "questionsTotal": 10,
+      "correctCount": 8
+    },
+    "stats": {
+      "quizzesTotal": 5,
+      "quizzesPassed": 3,
+      "averageScore": 72,
+      "coursesEnrolled": 1,
+      "coursesAuthored": 0,
+      "lessonsTotal": 12,
+      "lessonsCompleted": 7,
+      "streakDays": 4,
+      "lastActiveAt": "2025-09-04T12:25:00.000Z"
+    }
+  }
+}
+```
+
+Пример ответа:
+```json
+{
+  "attempt": {
+    "quizId": 10,
+    "score": 80,
+    "passed": true,
+    "correctCount": 8,
+    "questionsTotal": 10,
+    "updatedAt": "2025-09-04T12:25:00.000Z"
+  },
+  "stats": {
+    "quizzesTotal": 5,
+    "quizzesPassed": 3,
+    "averageScore": 72,
+    "coursesEnrolled": 1,
+    "coursesAuthored": 0,
+    "lessonsTotal": 12,
+    "lessonsCompleted": 7,
+    "streakDays": 4,
+    "lastActiveAt": "2025-09-04T12:25:00.000Z"
+  }
+}
+```
+
+### analytics.getAggByUserId
+
+Назначение: вернуть агрегаты по всем попыткам пользователя.
+
+Вход `data`:
+- `meta.requestId`
+- `userId`
+
+Пример запроса:
+```json
+{
+  "pattern": "analytics.getAggByUserId",
+  "data": { "meta": { "requestId": "req-2" }, "userId": 42 }
+}
+```
+
+Пример ответа (raw из SQL, значения строками):
+```json
+{
+  "cntAll": "5",
+  "cntPassed": "3",
+  "avgScore": "76.5",
+  "lessonsTotal": "4",
+  "lessonsCompleted": "3"
+}
+```
+
+## Хранилище
+
+Таблица `analystic` (имя как в сущности `QuizAttemptEntity`):
+
+| колонка | тип | примечание |
+|---|---|---|
+| id | serial PK | |
+| user_id | int | |
+| quiz_id | int | индекс |
+| lesson_id | int nullable | |
+| course_id | int nullable | |
+| questions_total | int | |
+| correct_count | int | |
+| score | int | 0..100 |
+| passed | boolean | |
+| created_at | timestamptz | |
+| updated_at | timestamptz | |
+
+Примечание: сервис делает upsert на уровне приложения по `(userId, quizId)`; уникальный индекс в БД пока не задан.
 
 ## Переменные окружения
 
-Пример: `.env.example`
-
+Минимальный набор:
 ```env
 NODE_ENV=development
-PORT=3005
+PORT=3008
 
-# RabbitMQ
+# RMQ
+RABBITMQ_URL=amqp://dev:dev@localhost:5672
 RMQ_URL=amqp://dev:dev@localhost:5672
+RMQ_ANALYTICS_QUEUE=analytics
+RMQ_PREFETCH=16
+RMQ_DLX=dlx
+RMQ_MESSAGE_TTL_MS=0
+RMQ_MAX_LENGTH=0
 
 # Postgres
 POSTGRES_HOST=localhost
@@ -60,275 +182,68 @@ POSTGRES_PORT=5432
 POSTGRES_DB=analytics_db
 POSTGRES_USER=analytics
 POSTGRES_PASSWORD=analytics
-
-# Бизнес‑настройки
-PASSING_SCORE=70
 ```
 
-> В Kubernetes значения подставляются через ConfigMap/Secret (см. ниже).
+Логи:
+- `SERVICE_NAME`, `SERVICE_VERSION` - метки сервиса.
+- `LOG_LEVEL` - уровень логов (default `info`).
+- `LOG_PRETTY=true` - читабельный вывод в dev.
 
----
+Важно:
+- Сейчас используются две переменные для URL RabbitMQ: `RABBITMQ_URL` (микросервис) и `RMQ_URL` (RMQ клиенты). Для корректного старта установите обе одинаково.
+- Приложение слушает порт `PORT` (по умолчанию 3008). В `Dockerfile` указан `EXPOSE 3002` - при необходимости выровняйте.
+- Таблица называется `analystic`, не `quiz_attempts`.
 
 ## Быстрый старт
 
-### Локально (Node)
-
+Локально:
 ```bash
-# 1) Установка зависимостей
 npm ci
-
-# 2) Заполни .env (см. .env.example) и подними Postgres + RabbitMQ
-
-# 3) Запуск сервиса в dev‑режиме (hot‑reload)
+# заполните .env по примеру выше
 npm run start:dev
 
-# Проверка здоровья
-curl http://localhost:3005/health/live
+curl http://localhost:3008/health/live
 ```
 
-### Docker Compose (dev)
-
-Минимальный compose для сервиса:
-
-```yaml
-services:
-  rabbitmq:
-    image: rabbitmq:3.13-management
-    ports: ["5672:5672", "15672:15672"]
-    environment:
-      RABBITMQ_DEFAULT_USER: dev
-      RABBITMQ_DEFAULT_PASS: dev
-
-  db_analytics:
-    image: postgres:17-alpine
-    environment:
-      POSTGRES_DB: analytics_db
-      POSTGRES_USER: analytics
-      POSTGRES_PASSWORD: analytics
-    ports: ["5435:5432"]
-
-  analytics:
-    image: your-registry/course_analytics:dev
-    env_file: .env
-    ports: ["3005:3005"]
-    depends_on: [rabbitmq, db_analytics]
-```
-
----
-
-## Публикация тестового события в RabbitMQ UI
-
-1. Открой **Queues**, выбери очередь **analytics** → **Publish message**.
-2. Отправляй payload в формате транспорта Nest (`{"pattern": "...", "data": {...}}`). Пример:
-
-```json
-{
-  "pattern": "quiz.submitted",
-  "data": {
-    "messageId": "test-uuid-1",
-    "occurredAt": "2025-09-04T12:25:00.000Z",
-    "payload": {
-      "userId": "user-1",
-      "quizId": 10,
-      "lessonId": 1,
-      "courseId": 17,
-      "questionsTotal": 10,
-      "correctCount": 8,
-      "score": 80,
-      "passed": true
-    }
-  }
-}
-```
-
-> Видишь в UI жёлтое *“Message published, but not routed”* — публикуешь не в ту очередь/эксчендж. Иди в **Queues → analytics → Publish message** и отправляй JSON в формате выше.
-
----
-
-## HTTP API
-
-### `GET /analytics/quiz/:quizId/summary`
-
-**Пример ответа:**
-
-```json
-{
-  "quizId": 10,
-  "participants": 42,
-  "passes": 31,
-  "passRate": 0.738,
-  "avgScore": 84.2
-}
-```
-
-### `GET /analytics/user/:userId/summary`
-
-**Пример ответа:**
-
-```json
-[
-  { "quizId": 10, "score": 80, "passed": true,  "updatedAt": "2025-09-04T12:25:00.000Z" },
-  { "quizId": 11, "score": 65, "passed": false, "updatedAt": "2025-09-01T10:00:00.000Z" }
-]
-```
-
----
-
-## Структура БД
-
-**Таблица `quiz_attempts`:**
-
-| колонка          | тип           | примечание                         |
-|------------------|---------------|------------------------------------|
-| id               | serial PK     |                                    |
-| message_id       | varchar(100)  | **UNIQUE** (идемпотентность)       |
-| user_id          | varchar(64)   |                                    |
-| quiz_id          | int           | **UNIQUE** вместе с `(user_id)`    |
-| lesson_id        | int null      |                                    |
-| course_id        | int null      |                                    |
-| questions_total  | int           |                                    |
-| correct_count    | int           |                                    |
-| score            | int           | 0..100                             |
-| passed           | boolean       |                                    |
-| created_at       | timestamptz   |                                    |
-| updated_at       | timestamptz   |                                    |
-
-**Индексы:**
-
-- `UNIQUE (user_id, quiz_id)`
-- `UNIQUE (message_id)`
-- `INDEX (quiz_id)`
-
----
-
-## Тесты и линт
+## Docker
 
 ```bash
-# Юнит‑тесты
-npm test
+# prod образ
+docker build -t analytics-service .
+docker run --env-file .env -p 3008:3008 analytics-service
 
-# Линтер
-npm run lint
+# dev (hot-reload)
+docker build --target dev -t analytics-dev .
+docker run --env-file .env -p 3008:3008 analytics-dev
 ```
 
-В проекте есть пример юнит‑теста `analytics.service.spec.ts`.
-Репозиторий и RMQ в тестах мокируются, БД не требуется.
+Если хотите использовать 3002 внутри контейнера, задайте `PORT=3002` и пробросьте `-p 3002:3002`.
 
----
+## Проверка здоровья
 
-## CI/CD и релизы
+- `GET /health/live`
+- `GET /health/ready`
 
-- PR в `main` → запускаются Lint/Build/Test.
-- Пуш тега `v*.*.*` или pre‑release (`v1.0.0-alpha1`, `v1.2.0-beta2`) →
-  GitHub Actions собирает multi‑arch Docker‑образ и пушит в Docker Hub:
+## Скрипты
 
-  ```
-  ${DOCKERHUB_USERNAME}/<repo>:<tag>
-  ${DOCKERHUB_USERNAME}/<repo>:latest
-  ```
+- `npm run start:dev` - dev режим.
+- `npm run build` - сборка.
+- `npm run start:prod` - запуск прод сборки.
+- `npm run lint` - линтер.
+- `npm test` - тесты (пока нет спецификаций).
 
-  Также создаётся ветка `release/<tag>` для быстрого rollback.
+## Структура проекта
 
-**Как создать тег**
+- `src/main.ts` - bootstrap HTTP и RMQ.
+- `src/modules/analytics` - обработчики RMQ и бизнес логика.
+- `src/modules/health` - health endpoints.
+- `src/common` - конфиг и логирование.
 
-Через GitHub Releases (UI):
+## Диагностика
 
-1. *Releases* → *New release*
-2. *Choose a tag*: `v1.0.0` или pre‑release `v1.0.0-alpha_1`
-3. Для нестабильной версии поставь чекбокс **Set as a pre-release**
-4. *Publish release*
-
-Через `git` (CLI):
-
-```bash
-git checkout main
-git pull
-git tag v1.0.0-alpha_1   # SemVer с точкой работает через CLI
-git push origin v1.0.0-alpha_1
-```
-
----
-
-## Kubernetes (примеры)
-
-**ConfigMap (dev):**
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: analytics-config
-  namespace: course
-data:
-  NODE_ENV: "development"
-  PORT: "3005"
-  RMQ_URL: "amqp://dev:dev@rabbitmq.course.svc:5672"
-  POSTGRES_HOST: "postgres.course.svc"
-  POSTGRES_PORT: "5432"
-  POSTGRES_DB: "analytics_db"
-  POSTGRES_USER: "analytics"
-```
-
-**Deployment (dev):**
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: analytics
-  namespace: course
-  labels:
-    app: analytics
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: analytics
-  template:
-    metadata:
-      labels:
-        app: analytics
-    spec:
-      containers:
-        - name: app
-          image: your-registry/course_analytics:dev
-          ports:
-            - name: http
-              containerPort: 3005
-          envFrom:
-            - configMapRef:
-                name: analytics-config
-            - secretRef:
-                name: jwt-public
-          env:
-            - name: POSTGRES_PASSWORD
-              value: "analytics"
-          readinessProbe:
-            httpGet:
-              path: /health/ready
-              port: http
-          livenessProbe:
-            httpGet:
-              path: /health/live
-              port: http
-          resources:
-            requests:
-              cpu: "50m"
-              memory: "128Mi"
-            limits:
-              cpu: "300m"
-              memory: "384Mi"
-```
-
----
-
-## Troubleshooting
-
-- **RabbitMQ UI:** *“Message published, but not routed”* — публикуешь не в ту очередь/эксчендж. Для тестов заходи в **Queues → analytics → Publish message** и отправляй JSON в формате `{ "pattern": "...", "data": {...} }`.
-- **PRECONDITION_FAILED – unknown delivery tag:** возникает при ручных `ack` после закрытия канала/дублирующемся `ack`. В текущей реализации обработчик делает авто‑ack через Nest при успешном завершении хендлера.
-- **`npm test` падает из‑за отсутствия тестов:** в CI/локально используем jest без `--passWithNoTests`. Добавь хотя бы один простой юнит‑тест (пример в `src/modules/analytics/test`).
-
----
+- RMQ connection errors: проверьте `RABBITMQ_URL` и `RMQ_URL`, доступность брокера.
+- Сообщения не обрабатываются: проверьте очередь `RMQ_ANALYTICS_QUEUE` (default `analytics`) и pattern.
+- Нет таблиц в БД: в prod синхронизация отключена, в dev включена.
 
 ## Лицензия
 
@@ -337,7 +252,7 @@ Version 1.0 — 2025-09-08
 
 Copyright (c) 2025
 Holder: Golovchenko Vasili Vyacheslavovich
-Contact: 
+Contact:
 
 1. Grant of License
 Licensor grants you a limited, non-exclusive, non-transferable, revocable license to download, install, and use the Software and its documentation (“Software”) solely for internal evaluation and non-production development within your organization. No right is granted to deploy the Software in production, provide it as a service to third parties, or use it for any commercial purpose.
@@ -375,4 +290,4 @@ You agree to comply with all applicable laws and regulations, including export c
 10. General
 If any provision is held unenforceable, it will be modified to the minimum extent necessary to be enforceable, and the remainder will remain in effect. This Agreement constitutes the entire agreement regarding the evaluation license and supersedes all prior discussions.
 
-For commercial/production licensing, contact: 
+For commercial/production licensing, contact:
