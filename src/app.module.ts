@@ -3,13 +3,14 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AnalyticsModule } from './modules/analytics/analytics.module';
 import { HealthModule } from './modules/health/health.module';
-import { AuthModule } from './guards/auth.module';
+import { LoggerModule } from './common/logger/logger.module';
+import { envSchema } from './common/config/validation';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
-      // cache: true,
       isGlobal: true,
+      validationSchema: envSchema,
       envFilePath:
         process.env.NODE_ENV === 'production' ? [] : ['.env', '../.env'],
       expandVariables: true,
@@ -32,9 +33,9 @@ import { AuthModule } from './guards/auth.module';
         maxQueryExecutionTime: 500,
       }),
     }),
-    AnalyticsModule,
+    LoggerModule,
     HealthModule,
-    AuthModule,
+    AnalyticsModule,
   ],
   controllers: [],
   providers: [],

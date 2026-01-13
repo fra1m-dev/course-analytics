@@ -1,27 +1,61 @@
-import { Body, Controller, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller } from '@nestjs/common';
 import { AnalyticsService } from './analytics.service';
-import { JwtAuthGuard } from 'src/guards/jwt-auth.guard';
-
-import { User } from 'src/decorators/user.decorator';
-import { JwtPayload } from 'src/interfaces/jwt-payload.interface';
-import { EventPattern, Payload } from '@nestjs/microservices';
-import { QuizSubmittedEvent } from 'src/contracts/quiz-submitted';
+import { MessagePattern, Payload, RpcException } from '@nestjs/microservices';
 import { SubmitQuizDto } from './dto/create-analytics.dto';
+import { AppLogger } from 'src/common/logger/logger.service';
+import { ANALYTICS_PATTERNS } from 'src/common/contracts/patterns';
+import { StatsModel } from 'src/common/models/stats-model';
 
-@Controller('analytics')
+@Controller()
 export class AnalyticsController {
-  constructor(private readonly service: AnalyticsService) {}
-
-  // === СТАРЫЙ ПУБЛИЧНЫЙ HTTP-КОНТРАКТ (как в монолите) ===
-  @UseGuards(JwtAuthGuard)
-  @Post('quiz/submit')
-  async submitQuiz(@Body() dto: SubmitQuizDto, @User() user: JwtPayload) {
-    return this.service.submitQuizHttp(user, dto);
+  constructor(
+    private readonly logger: AppLogger,
+    private readonly service: AnalyticsService,
+  ) {
+    this.logger.setContext(AnalyticsController.name);
   }
 
-  // === Подписчик на событие (остается для фан-ина с других сервисов) ===
-  @EventPattern('quiz.submitted')
-  async handleQuizSubmitted(@Payload() evt: QuizSubmittedEvent) {
-    await this.service.onQuizSubmitted(evt);
+  @MessagePattern(ANALYTICS_PATTERNS.ANALYTICS_SUBMIT)
+  async submitQuiz(
+    @Payload()
+    data: {
+      meta: { requestId: string };
+      dto: SubmitQuizDto;
+      userId: number;
+      stats: StatsModel;
+    },
+  ) {
+    try {
+      return await this.service.submitQuizAttempt(
+        data.userId,
+        data.dto,
+        data.stats,
+      );
+    } catch (e: any) {
+      this.logger.error(
+        { rid: data.meta?.requestId, err: e },
+        `${ANALYTICS_PATTERNS.ANALYTICS_SUBMIT} failed`,
+      );
+      throw new RpcException({
+        message: e?.message ?? `${ANALYTICS_PATTERNS.ANALYTICS_SUBMIT} failed`,
+      });
+    }
+  }
+
+  @MessagePattern(ANALYTICS_PATTERNS.ANALYTICS_AGG)
+  async getAggByUserId(
+    @Payload() data: { meta: { requestId: string }; userId: number },
+  ) {
+    try {
+      return await this.service.getAggByUserId(data.userId);
+    } catch (e: any) {
+      this.logger.error(
+        { rid: data.meta?.requestId, err: e },
+        `${ANALYTICS_PATTERNS.ANALYTICS_AGG} failed`,
+      );
+      throw new RpcException({
+        message: e?.message ?? `${ANALYTICS_PATTERNS.ANALYTICS_AGG} failed`,
+      });
+    }
   }
 }

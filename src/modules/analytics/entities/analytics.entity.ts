@@ -4,22 +4,16 @@ import {
   Column,
   CreateDateColumn,
   UpdateDateColumn,
-  Unique,
   Index,
 } from 'typeorm';
 
-@Entity({ name: 'quiz_attempts' })
-@Unique(['userId', 'quizId'])
+@Entity({ name: 'analystic' })
 export class QuizAttemptEntity {
   @PrimaryGeneratedColumn()
   id: number;
 
-  @Index({ unique: true })
-  @Column({ name: 'message_id', type: 'varchar', length: 100 })
-  messageId!: string; // идемпотентность
-
-  @Column({ name: 'user_id', type: 'varchar', length: 64 })
-  userId!: string;
+  @Column({ name: 'user_id' })
+  userId: number;
 
   @Index()
   @Column({ name: 'quiz_id', type: 'int' })
@@ -37,7 +31,7 @@ export class QuizAttemptEntity {
   @Column({ name: 'correct_count', type: 'int' })
   correctCount: number;
 
-  @Column({ name: 'score', type: 'int' }) // 0..100
+  @Column({ name: 'score', type: 'int' })
   score: number;
 
   @Column({ name: 'passed', type: 'boolean', default: false })

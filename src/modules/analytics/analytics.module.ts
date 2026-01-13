@@ -3,7 +3,6 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AnalyticsService } from './analytics.service';
 import { AnalyticsController } from './analytics.controller';
 import { QuizAttemptEntity } from './entities/analytics.entity';
-import { AuthModule } from 'src/guards/auth.module';
 import { ClientsModule, Transport } from '@nestjs/microservices';
 
 export const LESSONS_CLIENT = 'LESSONS_CLIENT';
@@ -14,7 +13,7 @@ export const BUS_CLIENT = 'BUS_CLIENT';
 @Module({
   imports: [
     TypeOrmModule.forFeature([QuizAttemptEntity]),
-    AuthModule,
+    // AuthModule,
     ClientsModule.register([
       {
         name: LESSONS_CLIENT,

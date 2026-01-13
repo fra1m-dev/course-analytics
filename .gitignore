@@ -11,6 +11,9 @@
 # /test
 docker-*
 
+# private packages
+.npmrc
+
 # Logs
 logs
 *.log
